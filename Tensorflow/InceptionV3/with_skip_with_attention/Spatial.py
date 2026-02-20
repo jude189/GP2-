@@ -34,7 +34,7 @@ keras.backend.clear_session()
 # =============================================================================
 drive.mount("/content/drive")
 
-# ✅ your tested base path
+
 DRIVE_BASE = "/content/drive/MyDrive/GP1/ISIC2017"
 
 TRAIN_IMG_DIR  = os.path.join(DRIVE_BASE, "train/images")
