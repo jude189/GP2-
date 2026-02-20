@@ -6,6 +6,10 @@
     - LR_Exponential_Decay
 - AdamW
   - ResNetUNet
+      -  ResNetUnet
+      -  ResNetSpacial
+  - ResNetInception
+      -
 
 ## TensorFlow
 - InceptionV3
