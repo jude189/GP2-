@@ -2,8 +2,8 @@
 ## PyTorch
 - Adam
   - ResNetUNet
-    - Scheduled_Learning_Rate_Stepwise
-    - Scheduled_Learning_Rate_Exponential_Decay
+    - LR_Stepwise
+    - LR_Exponential_Decay
 - AdamW
   - ResNetUNet
 
