@@ -9,7 +9,7 @@
 
 ## TensorFlow
 - InceptionV3
-  - With_Skip
+  - Baseline(V2.0)
   - With_Skip_With_Attention
     - Spatial
     - Dual
