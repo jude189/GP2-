@@ -4,4 +4,4 @@ pytorch/AdamW/ResNetUNet/model.py
 tensorflow/InceptionV3/With_Skip/model.py
 tensorflow/InceptionV3/With_Skip/With_Attention/model.py
 tensorflow/InceptionV3/With_Skip/With_Attention/Spacial_on_Skip/model.py
-tensorflow/InceptionV3/With_Skip/with_Attention/Dual_on_Skip/model.py
+tensorflow/InceptionV3/With_Skip/With_Attention/Dual_on_Skip/model.py
