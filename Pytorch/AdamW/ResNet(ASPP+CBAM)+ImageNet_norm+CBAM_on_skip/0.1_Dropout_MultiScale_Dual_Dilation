@@ -1,0 +1,584 @@
+import os, math, random
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from glob import glob
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+
+# =========================
+# 0) CONFIG
+# =========================
+BASE_PATH = "/kaggle/input/datasets/mahmudulhasantasin/isic-2017-original-dataset/isic 2017"
+
+TRAIN_IMG_DIR  = os.path.join(BASE_PATH, "ISIC-2017_Training_Data")
+TRAIN_MASK_DIR = os.path.join(BASE_PATH, "ISIC-2017_Training_Part1_GroundTruth")
+VAL_IMG_DIR    = os.path.join(BASE_PATH, "ISIC-2017_Validation_Data")
+VAL_MASK_DIR   = os.path.join(BASE_PATH, "ISIC-2017_Validation_Part1_GroundTruth")
+TEST_IMG_DIR   = os.path.join(BASE_PATH, "ISIC-2017_Test_v2_Data")
+TEST_MASK_DIR  = os.path.join(BASE_PATH, "ISIC-2017_Test_v2_Part1_GroundTruth")
+
+OUTPUT_DIR = "/kaggle/working/outputs_v3"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+IMG_SIZE        = (256, 256)
+BATCH_SIZE      = 8
+EPOCHS          = 60
+LR              = 1e-4
+SEED            = 42
+NUM_WORKERS     = 2
+PIN_MEMORY      = True
+AUX_LOSS_WEIGHT = 0.4   # weight for the two deep-supervision auxiliary losses
+
+# ImageNet stats (used inside the model so the raw [0,1] loader stays simple)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+# =========================
+# 1) SEED + DEVICE
+# =========================
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark     = True
+
+def get_device():
+    d = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Torch:", torch.__version__, " | Device:", d)
+    if d.type == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+    return d
+
+# =========================
+# 2) FILE PAIRING
+# =========================
+def _stem(p):
+    return os.path.splitext(os.path.basename(p))[0]
+
+def get_pairs(images_dir, masks_dir):
+    img_paths  = sorted(p for ext in ("*.jpg","*.jpeg","*.png")
+                         for p in glob(os.path.join(images_dir, ext)))
+    mask_paths = sorted(p for ext in ("*.png","*.jpg","*.jpeg")
+                         for p in glob(os.path.join(masks_dir, ext)))
+
+    mask_map = {}
+    for m in mask_paths:
+        s = _stem(m)
+        mask_map[s] = m
+        if s.endswith("_segmentation"):
+            mask_map[s.replace("_segmentation", "")] = m
+
+    X, y, missing = [], [], 0
+    for img in img_paths:
+        key = _stem(img)
+        if key in mask_map:
+            X.append(img);  y.append(mask_map[key])
+        else:
+            missing += 1
+    return X, y, len(img_paths), len(mask_paths), missing
+
+# =========================
+# 3) AUGMENTATION
+# =========================
+class AugPipeline:
+    def __init__(self, p_flip=0.5, p_rot90=0.5, p_bc=0.4,
+                 p_blur=0.3, p_erase=0.3, p_elastic=0.3):
+        self.p_flip=p_flip; self.p_rot90=p_rot90; self.p_bc=p_bc
+        self.p_blur=p_blur; self.p_erase=p_erase; self.p_elastic=p_elastic
+
+    def __call__(self, img, mask):
+        img, mask = img.copy(), mask.copy()
+        if random.random() < self.p_flip:
+            img, mask = np.fliplr(img).copy(), np.fliplr(mask).copy()
+        if random.random() < self.p_flip:
+            img, mask = np.flipud(img).copy(), np.flipud(mask).copy()
+        if random.random() < self.p_rot90:
+            k = random.choice([1,2,3])
+            img, mask = np.rot90(img,k).copy(), np.rot90(mask,k).copy()
+        if random.random() < self.p_bc:
+            alpha = random.uniform(0.75, 1.25)
+            beta  = random.uniform(-0.1,  0.1)
+            img   = np.clip(alpha*img + beta, 0.0, 1.0)
+        if random.random() < self.p_blur:
+            ksize  = random.choice([3,5])
+            img_u8 = (img*255).astype(np.uint8)
+            img    = cv2.GaussianBlur(img_u8,(ksize,ksize),0).astype(np.float32)/255.0
+        if random.random() < self.p_erase:
+            H,W = img.shape[:2]
+            rh  = random.randint(H//16, H//4)
+            rw  = random.randint(W//16, W//4)
+            r0  = random.randint(0, H-rh)
+            c0  = random.randint(0, W-rw)
+            img[r0:r0+rh, c0:c0+rw] = random.random()
+        if random.random() < self.p_elastic:
+            img, mask = self._grid_distort(img, mask)
+        return img, mask
+
+    @staticmethod
+    def _grid_distort(img, mask, num_steps=5, distort_limit=0.15):
+        H, W = img.shape[:2]
+        xs   = np.linspace(0, W, num_steps+1)
+        ys   = np.linspace(0, H, num_steps+1)
+        jx   = np.random.uniform(-distort_limit*W/num_steps,
+                                   distort_limit*W/num_steps,
+                                   (num_steps+1,num_steps+1)).astype(np.float32)
+        jy   = np.random.uniform(-distort_limit*H/num_steps,
+                                   distort_limit*H/num_steps,
+                                   (num_steps+1,num_steps+1)).astype(np.float32)
+        map_x = np.zeros((H,W),dtype=np.float32)
+        map_y = np.zeros((H,W),dtype=np.float32)
+        for i in range(num_steps):
+            for j in range(num_steps):
+                x0,x1 = int(xs[j]),int(xs[j+1])
+                y0,y1 = int(ys[i]),int(ys[i+1])
+                if x0>=x1 or y0>=y1: continue
+                py,px = np.mgrid[y0:y1, x0:x1]
+                bx = np.interp(px,[x0,x1],[jx[i,j],jx[i,j+1]])
+                by = np.interp(py,[y0,y1],[jy[i,j],jy[i+1,j]])
+                map_x[y0:y1,x0:x1] = px.astype(np.float32)+bx.astype(np.float32)
+                map_y[y0:y1,x0:x1] = py.astype(np.float32)+by.astype(np.float32)
+        img_u8  = (img*255).astype(np.uint8)
+        msk_u8  = (mask*255).astype(np.uint8)
+        img_out = cv2.remap(img_u8, map_x, map_y, cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_REFLECT_101)
+        msk_out = cv2.remap(msk_u8, map_x, map_y, cv2.INTER_NEAREST,
+                            borderMode=cv2.BORDER_REFLECT_101)
+        return img_out.astype(np.float32)/255.0, (msk_out>127).astype(np.float32)
+
+_AUG = AugPipeline()
+
+# =========================
+# 4) DATASET  (raw [0,1] → model handles ImageNet normalisation)
+# =========================
+class ISICDataset(Dataset):
+    def __init__(self, X, y, size=(256,256), augment=False):
+        self.X=X; self.y=y; self.size=size; self.augment=augment
+
+    def __len__(self): return len(self.X)
+
+    def __getitem__(self, idx):
+        img  = cv2.cvtColor(cv2.imread(self.X[idx]), cv2.COLOR_BGR2RGB)
+        img  = cv2.resize(img, self.size, interpolation=cv2.INTER_LINEAR)
+        img  = img.astype(np.float32) / 255.0
+        mask = cv2.imread(self.y[idx], 0)
+        mask = cv2.resize(mask, self.size, interpolation=cv2.INTER_NEAREST)
+        mask = (mask > 127).astype(np.float32)
+        if self.augment:
+            img, mask = _AUG(img, mask)
+        img  = torch.tensor(np.transpose(img,(2,0,1)), dtype=torch.float32)
+        mask = torch.tensor(mask[None], dtype=torch.float32)
+        return img, mask
+
+# =========================
+# 5) VISUALISATION HELPERS
+# =========================
+def save_batch_preview(loader, out_path, n=3):
+    xb, yb = next(iter(loader))
+    xb, yb = xb[:n].numpy(), yb[:n].numpy()
+    plt.figure(figsize=(12, 4*n))
+    for i in range(n):
+        img  = np.transpose(xb[i],(1,2,0))
+        mask = yb[i,0]
+        plt.subplot(n,3,3*i+1); plt.imshow(img);              plt.title("Image");   plt.axis("off")
+        plt.subplot(n,3,3*i+2); plt.imshow(mask,cmap="gray"); plt.title("Mask");    plt.axis("off")
+        ov = img.copy(); ov[...,0] = np.clip(ov[...,0]+0.5*mask,0,1)
+        plt.subplot(n,3,3*i+3); plt.imshow(ov);               plt.title("Overlay"); plt.axis("off")
+    plt.tight_layout(); plt.savefig(out_path,dpi=150,bbox_inches="tight"); plt.close()
+
+def save_history_plot(history, out_path):
+    plt.figure(figsize=(16,5))
+    for k,(tr,va,title) in enumerate([("loss","val_loss","Loss"),
+                                       ("dice","val_dice","Dice"),
+                                       ("iou","val_iou","IoU")]):
+        plt.subplot(1,3,k+1)
+        plt.plot(history[tr], label="train")
+        plt.plot(history[va], label="val")
+        plt.title(title); plt.legend(); plt.grid(True)
+    plt.tight_layout(); plt.savefig(out_path,dpi=150,bbox_inches="tight"); plt.close()
+
+def save_prediction_preview(model, loader, device, out_path, n=4, thr=0.5):
+    model.eval()
+    xb, yb = next(iter(loader))
+    xb = xb[:n].to(device)
+    with torch.no_grad():
+        out   = model(xb)
+        logits = out[0] if isinstance(out, tuple) else out
+        probs = torch.sigmoid(logits).cpu().numpy()
+        preds = (probs > thr).astype(np.float32)
+    xb_np, yb_np = xb.cpu().numpy(), yb[:n].numpy()
+    plt.figure(figsize=(12, 4*n))
+    for i in range(n):
+        img = np.transpose(xb_np[i],(1,2,0))
+        plt.subplot(n,4,4*i+1); plt.imshow(img);              plt.title("Image"); plt.axis("off")
+        plt.subplot(n,4,4*i+2); plt.imshow(yb_np[i,0],cmap="gray"); plt.title("GT"); plt.axis("off")
+        plt.subplot(n,4,4*i+3); plt.imshow(probs[i,0],cmap="gray"); plt.title("Prob"); plt.axis("off")
+        plt.subplot(n,4,4*i+4); plt.imshow(preds[i,0],cmap="gray"); plt.title("Bin"); plt.axis("off")
+    plt.tight_layout(); plt.savefig(out_path,dpi=150,bbox_inches="tight"); plt.close()
+
+# =========================
+# 6) METRICS + LOSS
+# =========================
+def dice_coeff(y_true, y_pred, eps=1e-6):
+    y_true = y_true.contiguous().view(y_true.size(0),-1)
+    y_pred = y_pred.contiguous().view(y_pred.size(0),-1)
+    inter  = (y_true*y_pred).sum(dim=1)
+    return ((2*inter+eps)/(y_true.sum(dim=1)+y_pred.sum(dim=1)+eps)).mean()
+
+def iou_score(y_true, y_pred, eps=1e-6):
+    y_true = y_true.contiguous().view(y_true.size(0),-1)
+    y_pred = y_pred.contiguous().view(y_pred.size(0),-1)
+    inter  = (y_true*y_pred).sum(dim=1)
+    union  = y_true.sum(dim=1)+y_pred.sum(dim=1)-inter
+    return ((inter+eps)/(union+eps)).mean()
+
+class BCEDiceLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+    def forward(self, logits, y_true):
+        return self.bce(logits,y_true) + 1.0 - dice_coeff(y_true, torch.sigmoid(logits))
+
+# =========================
+# 7) BUILDING BLOCKS
+# =========================
+
+# ── ImageNet normalisation layer ─────────────────────────────────────────────
+class ImageNetNorm(nn.Module):
+    """Normalises a [0,1] float tensor to ImageNet mean/std in-place."""
+    def __init__(self):
+        super().__init__()
+        mean = torch.tensor(IMAGENET_MEAN).view(1,3,1,1)
+        std  = torch.tensor(IMAGENET_STD ).view(1,3,1,1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std",  std)
+    def forward(self, x):
+        return (x - self.mean) / self.std
+
+# ── Basic double conv  +  optional Dropout2d ─────────────────────────────────
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, drop=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch,  out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Dropout2d(drop) if drop > 0.0 else nn.Identity(),
+        )
+    def forward(self, x): return self.net(x)
+
+# ── ① Dual-Dilation ASPP ─────────────────────────────────────────────────────
+class DualDilationASPP(nn.Module):
+    """
+    Two dilated pyramids fused into one bottleneck representation:
+      Pyramid A – coarse:  rates (6, 12, 18)
+      Pyramid B – fine:    rates (3,  6,  9)
+    Plus a 1×1 conv and a global-average-pool branch.
+    All 8 branches (1 + 3 + 3 + 1) projected to out_ch, concatenated,
+    then fused with a 1×1 projection + Dropout2d.
+    """
+    def __init__(self, in_ch: int, out_ch: int,
+                 rates_a=(6,12,18), rates_b=(3,6,9), drop=0.1):
+        super().__init__()
+        def _branch(r):
+            return nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 3, padding=r, dilation=r, bias=False),
+                nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            )
+        self.b0 = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        )
+        self.branches_a = nn.ModuleList([_branch(r) for r in rates_a])
+        self.branches_b = nn.ModuleList([_branch(r) for r in rates_b])
+        self.gap = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+        )
+        n_parts = 1 + len(rates_a) + len(rates_b) + 1   # b0 + a + b + gap
+        self.project = nn.Sequential(
+            nn.Conv2d(n_parts*out_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Dropout2d(drop),
+        )
+
+    def forward(self, x):
+        h, w   = x.shape[-2:]
+        parts  = [self.b0(x)]
+        parts += [br(x) for br in self.branches_a]
+        parts += [br(x) for br in self.branches_b]
+        gap    = F.interpolate(self.gap(x),(h,w),mode="bilinear",align_corners=False)
+        parts.append(gap)
+        return self.project(torch.cat(parts,dim=1))
+
+# ── ② CBAM (Convolutional Block Attention Module) ─────────────────────────────
+class ChannelAttention(nn.Module):
+    def __init__(self, ch, reduction=16):
+        super().__init__()
+        mid = max(ch//reduction, 1)
+        self.mlp = nn.Sequential(
+            nn.Flatten(), nn.Linear(ch,mid), nn.ReLU(inplace=True), nn.Linear(mid,ch)
+        )
+    def forward(self, x):
+        avg = self.mlp(F.adaptive_avg_pool2d(x,1))
+        mx  = self.mlp(F.adaptive_max_pool2d(x,1))
+        return x * torch.sigmoid(avg+mx).view(x.size(0),x.size(1),1,1)
+
+class SpatialAttentionCBAM(nn.Module):
+    def __init__(self, ks=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2,1,ks,padding=(ks-1)//2,bias=False)
+        self.bn   = nn.BatchNorm2d(1)
+    def forward(self, x):
+        avg = x.mean(dim=1,keepdim=True)
+        mx,_ = x.max(dim=1,keepdim=True)
+        return x * torch.sigmoid(self.bn(self.conv(torch.cat([avg,mx],dim=1))))
+
+class CBAM(nn.Module):
+    def __init__(self, ch, reduction=16, spatial_kernel=7):
+        super().__init__()
+        self.ca = ChannelAttention(ch, reduction)
+        self.sa = SpatialAttentionCBAM(spatial_kernel)
+    def forward(self, x): return self.sa(self.ca(x))
+
+# ── ③ Decoder UpBlock with CBAM on the skip + Dropout ───────────────────────
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch, drop=0.1):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.cbam = CBAM(skip_ch)                          # refine the skip
+        self.conv = ConvBlock(out_ch+skip_ch, out_ch, drop=drop)
+
+    def forward(self, x, skip):
+        g = self.up(x)
+        if g.shape[-2:] != skip.shape[-2:]:
+            g = F.interpolate(g, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        skip = self.cbam(skip)
+        return self.conv(torch.cat([g, skip], dim=1))
+
+# =========================
+# 8) FULL MODEL
+# =========================
+class ResNetUNetV3(nn.Module):
+    """
+    ResNet-34 encoder
+    + ImageNet normalisation inside the model
+    + Dual-Dilation ASPP bottleneck
+    + CBAM on every skip connection
+    + Dropout2d in ASPP and decoder ConvBlocks
+    + Deep supervision (two auxiliary heads at 1/8 and 1/4 resolution)
+      – active only during training (returns tuple); eval returns single logit map
+    """
+    def __init__(self, pretrained=True, drop=0.1):
+        super().__init__()
+        self.norm = ImageNetNorm()
+
+        enc = models.resnet34(
+            weights=models.ResNet34_Weights.DEFAULT if pretrained else None
+        )
+        self.stem = nn.Sequential(enc.conv1, enc.bn1, enc.relu)  # /2  64ch
+        self.pool = enc.maxpool                                   # /4  64ch
+        self.e1   = enc.layer1    # /4   64ch
+        self.e2   = enc.layer2    # /8  128ch
+        self.e3   = enc.layer3    # /16 256ch
+        self.e4   = enc.layer4    # /32 512ch
+
+        # Bottleneck
+        self.aspp = DualDilationASPP(512, 512, drop=drop)
+        self.cbam_bot = CBAM(512)
+
+        # Decoder
+        self.d1 = UpBlock(512, 256, 256, drop=drop)
+        self.d2 = UpBlock(256, 128, 128, drop=drop)
+        self.d3 = UpBlock(128,  64,  64, drop=drop)
+        self.d4 = UpBlock( 64,  64,  64, drop=drop)
+
+        # Main head
+        self.final_up = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.final    = nn.Sequential(ConvBlock(32, 32, drop=0.0), nn.Conv2d(32, 1, 1))
+
+        # ④ Deep-supervision auxiliary heads
+        self.aux1 = nn.Conv2d(256, 1, 1)   # after d1 (1/16 → upsampled)
+        self.aux2 = nn.Conv2d(128, 1, 1)   # after d2 (1/8  → upsampled)
+
+    def forward(self, x):
+        x = self.norm(x)
+
+        # Encoder
+        s0 = self.stem(x)      # (B, 64,  H/2,  W/2)
+        p  = self.pool(s0)     # (B, 64,  H/4,  W/4)
+        s1 = self.e1(p)        # (B, 64,  H/4,  W/4)
+        s2 = self.e2(s1)       # (B,128,  H/8,  W/8)
+        s3 = self.e3(s2)       # (B,256, H/16, W/16)
+        s4 = self.e4(s3)       # (B,512, H/32, W/32)
+
+        # Bottleneck
+        b = self.cbam_bot(self.aspp(s4))
+
+        # Decoder
+        d1 = self.d1(b,  s3)   # (B,256, H/16, H/16)
+        d2 = self.d2(d1, s2)   # (B,128, H/8,  W/8)
+        d3 = self.d3(d2, s1)   # (B, 64, H/4,  W/4)
+        d4 = self.d4(d3, s0)   # (B, 64, H/2,  W/2)
+
+        # Main logits
+        out = self.final(self.final_up(d4))   # (B,1,H,W)
+
+        if self.training:
+            H, W  = x.shape[-2:]
+            aux1  = F.interpolate(self.aux1(d1),(H,W),mode="bilinear",align_corners=False)
+            aux2  = F.interpolate(self.aux2(d2),(H,W),mode="bilinear",align_corners=False)
+            return out, aux1, aux2
+        return out
+
+# =========================
+# 9) TRAIN / EVAL LOOPS
+# =========================
+def run_epoch(model, loader, device, criterion, optimizer=None, train=False,
+              aux_weight=AUX_LOSS_WEIGHT):
+    model.train() if train else model.eval()
+    total_loss = total_dice = total_iou = 0.0
+
+    for xb, yb in tqdm(loader, desc="train" if train else "val", leave=True):
+        xb, yb = xb.to(device), yb.to(device)
+        if train:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(train):
+            output = model(xb)
+            if isinstance(output, tuple):
+                logits, aux1, aux2 = output
+                loss = (criterion(logits, yb)
+                        + aux_weight * criterion(aux1, yb)
+                        + aux_weight * criterion(aux2, yb))
+            else:
+                logits = output
+                loss   = criterion(logits, yb)
+            if train:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+            total_dice += dice_coeff(yb, preds).item()
+            total_iou  += iou_score(yb, preds).item()
+        total_loss += loss.item()
+
+    n = max(1, len(loader))
+    return total_loss/n, total_dice/n, total_iou/n
+
+def evaluate(model, loader, device, criterion):
+    model.eval()
+    total_loss = total_dice = total_iou = 0.0
+    with torch.no_grad():
+        for xb, yb in tqdm(loader, desc="test", leave=True):
+            xb, yb = xb.to(device), yb.to(device)
+            logits = model(xb)                 # eval → single tensor
+            total_loss += criterion(logits, yb).item()
+            probs  = torch.sigmoid(logits)
+            preds  = (probs > 0.5).float()
+            total_dice += dice_coeff(yb, preds).item()
+            total_iou  += iou_score(yb, preds).item()
+    n = max(1, len(loader))
+    return total_loss/n, total_dice/n, total_iou/n
+
+# =========================
+# 10) MAIN
+# =========================
+def main():
+    set_seed(SEED)
+    device = get_device()
+
+    train_X, train_y, n_ti, n_tm, miss_t = get_pairs(TRAIN_IMG_DIR, TRAIN_MASK_DIR)
+    val_X,   val_y,   n_vi, n_vm, miss_v = get_pairs(VAL_IMG_DIR,   VAL_MASK_DIR)
+    test_X,  test_y,  n_xi, n_xm, miss_x = get_pairs(TEST_IMG_DIR,  TEST_MASK_DIR)
+
+    print(f"Train: images={n_ti} masks={n_tm} paired={len(train_X)} missing={miss_t}")
+    print(f"Val:   images={n_vi} masks={n_vm} paired={len(val_X)}   missing={miss_v}")
+    print(f"Test:  images={n_xi} masks={n_xm} paired={len(test_X)}  missing={miss_x}")
+
+    if not (train_X and val_X and test_X):
+        raise RuntimeError("One split has 0 paired samples – check file names.")
+
+    train_ds = ISICDataset(train_X, train_y, size=IMG_SIZE, augment=True)
+    val_ds   = ISICDataset(val_X,   val_y,   size=IMG_SIZE, augment=False)
+    test_ds  = ISICDataset(test_X,  test_y,  size=IMG_SIZE, augment=False)
+
+    train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    val_loader   = DataLoader(val_ds,  BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    test_loader  = DataLoader(test_ds, BATCH_SIZE, shuffle=False,
+                              num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+
+    save_batch_preview(train_loader, os.path.join(OUTPUT_DIR, "train_batch_preview.png"))
+
+    model = ResNetUNetV3(pretrained=True, drop=0.1).to(device)
+    print(f"\nModel: {model.__class__.__name__}")
+    print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    criterion = BCEDiceLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    best_val_dice  = -1.0
+    early_patience = 15
+    patience_count = 0
+    history = {k:[] for k in ("loss","val_loss","dice","val_dice","iou","val_iou")}
+    ckpt_path = os.path.join(OUTPUT_DIR, "best_model.pt")
+
+    for epoch in range(1, EPOCHS+1):
+        print(f"\nEpoch {epoch}/{EPOCHS}  (LR={optimizer.param_groups[0]['lr']:.2e})")
+        tr_loss, tr_dice, tr_iou = run_epoch(model, train_loader, device,
+                                             criterion, optimizer, train=True)
+        va_loss, va_dice, va_iou = run_epoch(model, val_loader,   device,
+                                             criterion, train=False)
+        scheduler.step()
+
+        for k,v in zip(("loss","dice","iou","val_loss","val_dice","val_iou"),
+                       (tr_loss, tr_dice, tr_iou, va_loss, va_dice, va_iou)):
+            history[k].append(v)
+
+        print(f"  train  loss={tr_loss:.4f}  dice={tr_dice:.4f}  iou={tr_iou:.4f}")
+        print(f"  val    loss={va_loss:.4f}  dice={va_dice:.4f}  iou={va_iou:.4f}")
+
+        if va_dice > best_val_dice:
+            best_val_dice  = va_dice
+            patience_count = 0
+            torch.save({"model_state": model.state_dict(),
+                        "epoch": epoch, "val_dice": va_dice}, ckpt_path)
+            print(f"  ✓ Saved best checkpoint  (val_dice={va_dice:.4f})")
+        else:
+            patience_count += 1
+            if patience_count >= early_patience:
+                print("Early stopping triggered.")
+                break
+
+    save_history_plot(history, os.path.join(OUTPUT_DIR, "training_curves.png"))
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    print(f"\nLoaded best checkpoint: epoch {ckpt['epoch']}  val_dice={ckpt['val_dice']:.4f}")
+
+    te_loss, te_dice, te_iou = evaluate(model, test_loader, device, criterion)
+    print(f"\nTEST  loss={te_loss:.4f}  dice={te_dice:.4f}  iou={te_iou:.4f}")
+
+    save_prediction_preview(model, test_loader, device,
+                            os.path.join(OUTPUT_DIR, "test_pred_preview.png"), n=4)
+
+    final_path = os.path.join(OUTPUT_DIR, "final_model_state_dict.pt")
+    torch.save(model.state_dict(), final_path)
+    print(f"\nDONE. Saved → {final_path}")
+
+if __name__ == "__main__":
+    main()
